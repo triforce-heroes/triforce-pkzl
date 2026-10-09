@@ -1,7 +1,7 @@
 {
   "name": "@triforce-heroes/triforce-pkzl",
   "version": "1.0.0",
-  "description": "Rebuild Text_000.pkz with raw replacements while preserving untouched files.",
+  "description": "Build compact PKZL patches from raw files without an original archive.",
   "license": "Apache License 2.0",
   "files": [
     "dist"
@@ -34,7 +34,7 @@
   },
   "devDependencies": {
     "@rheactor/rheactor-oxc-config": "github:rheactor/rheactor-oxc-config",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "oxfmt": "^0.72.0",
     "oxlint": "^1.87.0",
     "tsdown": "^0.23.0",

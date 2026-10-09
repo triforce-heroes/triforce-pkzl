@@ -1,72 +1,62 @@
 import { BufferBuilder } from "@triforce-heroes/triforce-core/BufferBuilder";
-import { BufferConsumer } from "@triforce-heroes/triforce-core/BufferConsumer";
 import { nextMultiple } from "@triforce-heroes/triforce-core/Number";
 
+const HEADER_SIZE = 32;
 const ENTRY_SIZE = 32;
+const VERSION = 0x00_02_00_00;
+const HEADER_FLAGS = 0x10_00;
 const ALIGNMENT = 64;
-// None is at 0x10 in the original Text_000.pkz string table.
-const NONE_OFFSET = 0x10;
+const STRING_ALIGNMENT = 8;
 
-export type RawReplacements = ReadonlyMap<string, Buffer>;
+interface FileEntry {
+  pathOffset: number;
+  payload: Buffer;
+}
 
-export function rebuild(data: Buffer, replacements: RawReplacements): Buffer {
-  const reader = new BufferConsumer(data, 16);
-  const entryCount = reader.readUnsignedInt32();
-  const indexOffset = reader.readUnsignedInt32();
-  const stringTableSize = reader.readUnsignedInt32();
-  const stringTableOffset = indexOffset + entryCount * ENTRY_SIZE;
-  const stringsEnd = stringTableOffset + stringTableSize;
-  const stringReader = new BufferConsumer(data);
-  const pending = new Map(replacements);
-  const payloads: Buffer[] = [];
+export type RawFiles = ReadonlyMap<string, Buffer>;
+
+export function rebuild(files: RawFiles): Buffer {
+  const entries: FileEntry[] = [];
+  const strings = new BufferBuilder();
+
+  strings.writeNullTerminatedString("None");
+  strings.pad(STRING_ALIGNMENT);
+
+  for (const [path, payload] of files) {
+    entries.push({ pathOffset: strings.length, payload });
+    strings.writeNullTerminatedString(path);
+    strings.pad(STRING_ALIGNMENT);
+  }
+
   const file = new BufferBuilder();
-  let payloadOffset = nextMultiple(stringsEnd, ALIGNMENT);
+  let payloadOffset = nextMultiple(
+    HEADER_SIZE + entries.length * ENTRY_SIZE + strings.length,
+    ALIGNMENT,
+  );
 
-  file.push(data.subarray(0, 8));
+  file.writeString("pkzl");
+  file.writeUnsignedInt32(VERSION);
   file.writeUnsignedInt64(() => BigInt(file.length));
-  file.push(data.subarray(16, indexOffset));
+  file.writeUnsignedInt32(entries.length);
+  file.writeUnsignedInt32(HEADER_SIZE);
+  file.writeUnsignedInt32(strings.length);
+  file.writeUnsignedInt32(HEADER_FLAGS);
 
-  reader.seek(indexOffset);
-
-  for (let index = 0; index < entryCount; index++) {
-    const recordOffset = reader.byteOffset;
-    const pathOffset = reader.readUnsignedInt32();
-
-    reader.skip(12);
-    const offset = Number(reader.readUnsignedInt64());
-    const storedSize = Number(reader.readUnsignedInt64());
-
-    stringReader.seek(stringTableOffset + pathOffset);
-    const path = stringReader.readNullTerminatedString();
-    const replacement = pending.get(path);
-    const payload = replacement ?? data.subarray(offset, offset + storedSize);
-
-    pending.delete(path);
-    payloads.push(payload);
-
-    if (replacement === undefined) {
-      file.push(data.subarray(recordOffset, recordOffset + 16));
-    } else {
-      file.writeUnsignedInt32(pathOffset);
-      file.writeUnsignedInt32(NONE_OFFSET);
-      file.writeUnsignedInt64(BigInt(payload.length));
-    }
-
+  for (const entry of entries) {
+    file.writeUnsignedInt32(entry.pathOffset);
+    file.writeUnsignedInt32(0);
+    file.writeUnsignedInt64(BigInt(entry.payload.length));
     file.writeUnsignedInt64(BigInt(payloadOffset));
-    file.writeUnsignedInt64(BigInt(payload.length));
+    file.writeUnsignedInt64(BigInt(entry.payload.length));
 
-    payloadOffset = nextMultiple(payloadOffset + payload.length, ALIGNMENT);
+    payloadOffset = nextMultiple(payloadOffset + entry.payload.length, ALIGNMENT);
   }
 
-  if (pending.size > 0) {
-    throw new Error(`PKZL: replacement path does not exist: ${pending.keys().next().value}.`);
-  }
-
-  file.push(data.subarray(stringTableOffset, stringsEnd));
+  file.push(strings.build());
   file.pad(ALIGNMENT);
 
-  for (const payload of payloads) {
-    file.push(payload);
+  for (const entry of entries) {
+    file.push(entry.payload);
     file.pad(ALIGNMENT);
   }
 

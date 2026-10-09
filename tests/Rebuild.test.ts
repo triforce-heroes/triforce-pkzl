@@ -1,47 +1,132 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-
 import { describe, expect, it } from "vitest";
 
 import { rebuild } from "#/Rebuild";
 
-const original = await readFile(new URL("fixtures/Text_000.pkz", import.meta.url));
 const path = "Text/Prologue_USen.bin";
-const payload = Buffer.from("PKZL replacement fixture");
-const replacements = new Map([[path, payload]]);
+const payload = Buffer.from("PKZL file buffer fixture");
+const files = new Map([[path, payload]]);
+
+interface PatchEntry {
+  path: string;
+  compression: string;
+  size: number;
+  offset: number;
+  storedSize: number;
+  payload: Buffer;
+}
+
+function readEntries(data: Buffer): PatchEntry[] {
+  const count = data.readUInt32LE(16);
+  const indexOffset = data.readUInt32LE(20);
+  const stringTableOffset = indexOffset + count * 32;
+  const entries: PatchEntry[] = [];
+
+  for (let index = 0; index < count; index++) {
+    const recordOffset = indexOffset + index * 32;
+    const pathOffset = stringTableOffset + data.readUInt32LE(recordOffset);
+    const compressionOffset = stringTableOffset + data.readUInt32LE(recordOffset + 4);
+    const size = Number(data.readBigUInt64LE(recordOffset + 8));
+    const offset = Number(data.readBigUInt64LE(recordOffset + 16));
+    const storedSize = Number(data.readBigUInt64LE(recordOffset + 24));
+
+    entries.push({
+      path: data.toString("utf-8", pathOffset, data.indexOf(0, pathOffset)),
+      compression: data.toString("utf-8", compressionOffset, data.indexOf(0, compressionOffset)),
+      size,
+      offset,
+      storedSize,
+      payload: data.subarray(offset, offset + storedSize),
+    });
+  }
+
+  return entries;
+}
 
 describe(rebuild, () => {
-  it("injects a raw buffer into the fixed Oodle entry", () => {
-    const result = rebuild(original, replacements);
+  it("creates a compact patch containing only the supplied raw file", () => {
+    const result = rebuild(files);
 
-    // Prologue_USen is entry 189 in the unchanged Text fixture.
-    expect(original.toString("utf-8", 0x30_b0, 0x30_c6)).toBe(path);
-    expect(result.toString("hex", 0x17_c0, 0x17_e0)).toBe(
-      "70120000100000001800000000000000405f1f00000000001800000000000000",
-    );
-    expect(result.toString("hex", 0x1f_5f_40, 0x1f_5f_58)).toBe(
-      "504b5a4c207265706c6163656d656e742066697874757265",
-    );
+    expect(result).toHaveLength(192);
+    expect(result.toString("utf-8", 0, 4)).toBe("pkzl");
+    expect(result.readUInt32LE(4)).toBe(0x00_02_00_00);
+    expect(result.readBigUInt64LE(8)).toBe(BigInt(result.length));
+    expect(result.readUInt32LE(20)).toBe(32);
+    expect(result.readUInt32LE(24)).toBe(32);
+    expect(result.readUInt32LE(28)).toBe(0x10_00);
+    expect(readEntries(result)).toStrictEqual([
+      {
+        path,
+        compression: "None",
+        size: payload.length,
+        offset: 128,
+        storedSize: payload.length,
+        payload,
+      },
+    ]);
+    expect(result.indexOf("OodleKraken")).toBe(-1);
+    expect(result.indexOf("Text/archive_CSzk.bin")).toBe(-1);
   });
 
-  it("throws when the replacement path does not exist", () => {
-    expect(() => rebuild(original, new Map([["Text/missing_USen.bin", payload]]))).toThrow(
-      "PKZL: replacement path does not exist: Text/missing_USen.bin.",
-    );
+  it("creates entries for supplied paths without consulting an original archive", () => {
+    const newPath = "Text/new_USen.bin";
+    const result = rebuild(new Map([[newPath, payload]]));
+    const entries = readEntries(result);
+
+    expect(entries).toHaveLength(1);
+    expect(entries.at(0)?.path).toBe(newPath);
+    expect(entries.at(0)?.payload).toStrictEqual(payload);
   });
 
-  it("matches the expected rebuilt archive and preserves the original", () => {
-    const result = rebuild(original, replacements);
+  interface PayloadCase {
+    label: string;
+    size: number;
+  }
 
-    expect(result).toHaveLength(2_337_536);
-    expect(result.toString("hex", 0, 32)).toBe(
-      "706b7a6c0000020000ab230000000000f100000020000000a817000000100000",
+  const payloadCases: PayloadCase[] = [
+    { label: "empty", size: 0 },
+    { label: "aligned", size: 64 },
+    { label: "unaligned", size: 65 },
+  ];
+
+  it.each(payloadCases)("aligns multiple raw files with an $label payload", ({ size }) => {
+    const firstPath = "Text/archive_CSzk.bin";
+    const firstPayload = Buffer.alloc(size, 0x61);
+    const result = rebuild(
+      new Map([
+        [path, payload],
+        [firstPath, firstPayload],
+      ]),
     );
-    expect(createHash("sha256").update(result).digest("hex")).toBe(
-      "db1be7267b6001c67009adfa497d1dd8d2c3415b629d6fd95bc707ce33014d9a",
-    );
-    expect(createHash("sha256").update(original).digest("hex")).toBe(
-      "27331a89c45f1708480624e572d3d73a29aea3cd50544d74273bd52e1d7c35e2",
-    );
+    const entries = readEntries(result);
+
+    expect(entries.map((entry) => entry.path)).toStrictEqual([path, firstPath]);
+    expect(entries.map((entry) => entry.payload)).toStrictEqual([payload, firstPayload]);
+    expect(entries.map((entry) => entry.compression)).toStrictEqual(["None", "None"]);
+    expect(entries.map((entry) => entry.size)).toStrictEqual([payload.length, size]);
+    expect(entries.map((entry) => entry.storedSize)).toStrictEqual([payload.length, size]);
+
+    for (const entry of entries) {
+      expect(entry.offset % 64).toBe(0);
+      expect(entry.offset).toBeLessThanOrEqual(result.length);
+    }
+
+    expect(result.length % 64).toBe(0);
+    expect(result.readBigUInt64LE(8)).toBe(BigInt(result.length));
+  });
+
+  it("creates an empty patch when there are no files", () => {
+    const result = rebuild(new Map());
+
+    expect(result).toHaveLength(64);
+    expect(result.readBigUInt64LE(8)).toBe(64n);
+    expect(readEntries(result)).toStrictEqual([]);
+  });
+
+  it("preserves the file map and buffers", () => {
+    rebuild(files);
+
+    expect(payload.toString()).toBe("PKZL file buffer fixture");
+    expect(files.size).toBe(1);
+    expect(files.get(path)).toBe(payload);
   });
 });
